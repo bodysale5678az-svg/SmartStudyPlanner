@@ -11,9 +11,35 @@
 #include <algorithm>
 #include <regex>
 #include <thread>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
+
+// ---------- cross-platform sockets ----------
+// The server runs on Windows (Winsock) and on POSIX systems (Berkeley
+// sockets). Keeping the abstraction small lets the same file build in
+// both environments, which is what CI on Linux relies on.
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+    using socket_t = SOCKET;
+    static const socket_t INVALID_SOCK = INVALID_SOCKET;
+    inline int closeSocket(socket_t s) { return closesocket(s); }
+    inline void initSockets() {
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+    }
+    inline void cleanupSockets() { WSACleanup(); }
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    using socket_t = int;
+    static const socket_t INVALID_SOCK = -1;
+    inline int closeSocket(socket_t s) { return close(s); }
+    inline void initSockets() { /* nothing to initialise on POSIX */ }
+    inline void cleanupSockets() { /* nothing to clean up on POSIX */ }
+#endif
+
 using namespace std;
 class Task {
 public:
@@ -430,55 +456,52 @@ void SmartStudyPlanner::loadData() {
     cout << "Data loaded from " << filename << endl;
 }
 
-#ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #pragma comment(lib, "ws2_32.lib")
-#else
-    #include <sys/socket.h>
-    #include <netinet/in.h>
-    #include <unistd.h>
-#endif
-
 class WebServer {
 public:
-#ifdef _WIN32
-    WSADATA wsaData;
-#endif
-
     WebServer() {
-#ifdef _WIN32
-        WSAStartup(MAKEWORD(2,2), &wsaData);
-#endif
+        initSockets();
     }
 
     ~WebServer() {
-#ifdef _WIN32
-        WSACleanup();
-#endif
+        cleanupSockets();
     }
 
     void start(SmartStudyPlanner& planner) {
-        SOCKET server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        socket_t server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd == INVALID_SOCK) {
+            cerr << "Failed to create socket\n";
+            return;
+        }
+
+        // Allow quick restarts while developing
+        int opt = 1;
+        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&opt), sizeof(opt));
+
         sockaddr_in address = {};
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = INADDR_ANY;
         address.sin_port = htons(3000);
 
-        bind(server_fd, (sockaddr*)&address, sizeof(address));
+        if (bind(server_fd, (sockaddr*)&address, sizeof(address)) < 0) {
+            cerr << "Bind failed on port 3000\n";
+            closeSocket(server_fd);
+            return;
+        }
         listen(server_fd, SOMAXCONN);
-        cout << "\033[32m🚀 Server OK → http://localhost:3000\033[0m\n";
+        cout << "Server OK -> http://localhost:3000\n";
+        cout.flush();
 
         while (true) {
-            SOCKET client_fd = accept(server_fd, NULL, NULL);
-            if (client_fd != INVALID_SOCKET) {
+            socket_t client_fd = accept(server_fd, NULL, NULL);
+            if (client_fd != INVALID_SOCK) {
                 thread([this, client_fd, &planner]() {
                     handleRequest(client_fd, planner);
-                    closesocket(client_fd);
+                    closeSocket(client_fd);
                 }).detach();
             }
         }
-        closesocket(server_fd);
+        closeSocket(server_fd);
     }
 
 private:
@@ -488,7 +511,7 @@ private:
         if (log) log << message << "\n";
     }
 
-    void handleRequest(SOCKET client_fd, SmartStudyPlanner& planner) {
+    void handleRequest(socket_t client_fd, SmartStudyPlanner& planner) {
         char buffer[16384] = {0};
         string request;
 
@@ -577,7 +600,7 @@ private:
         }
     }
 
-    void sendHTML(SOCKET client_fd) {
+    void sendHTML(socket_t client_fd) {
         string html = R"HTML(
 <!DOCTYPE html>
 
@@ -668,7 +691,7 @@ setInterval(refresh, 3000);
         response += "Content-Type: text/html; charset=utf-8\r\n";
         response += "Cache-Control: no-cache\r\n\r\n";
         response += html;
-        send(client_fd, response.c_str(), response.length(), 0);
+        send(client_fd, response.c_str(), (int)response.length(), 0);
     }
 
     void parsePOSTData(const string& request, SmartStudyPlanner& planner) {
@@ -760,7 +783,7 @@ setInterval(refresh, 3000);
         }
     }
 
-    void sendTasksJSON(SOCKET client_fd, SmartStudyPlanner& planner) {
+    void sendTasksJSON(socket_t client_fd, SmartStudyPlanner& planner) {
         vector<Task*> tasks = planner.getActiveTasks();
         string json = "[";
 
@@ -787,7 +810,7 @@ setInterval(refresh, 3000);
         response += "Access-Control-Allow-Origin: *\r\n\r\n";
         response += json;
 
-        send(client_fd, response.c_str(), response.length(), 0);
+        send(client_fd, response.c_str(), (int)response.length(), 0);
         cout << "📤 Sent " << tasks.size() << " tasks\n";
     }
 
@@ -809,16 +832,31 @@ setInterval(refresh, 3000);
         }
     }
 };
-#pragma comment(lib, "ws2_32.lib")
-#include <winsock2.h>
-#include <iostream>
-#include <string>
-#include <thread>
-using namespace std;
 
-int main() {
+int main(int argc, char** argv) {
+    // --selftest: exercise the planner without starting the network server.
+    // Used by CI so the build can be validated headlessly.
+    if (argc > 1 && string(argv[1]) == "--selftest") {
+        cout << "[selftest] starting\n";
+
+        SmartStudyPlanner planner("selftest.json");
+        planner.addTaskFromWeb("Sample Task", "Testing", 60, "2026-12-31", 5);
+
+        auto tasks = planner.getActiveTasks();
+        cout << "[selftest] tasks=" << tasks.size() << "\n";
+        if (!tasks.empty()) {
+            cout << "[selftest] first=" << tasks.front()->name
+                 << " subject=" << tasks.front()->subject
+                 << " priority=" << tasks.front()->priority << "\n";
+        }
+
+        bool ok = tasks.size() == 1 && tasks.front()->name == "Sample Task";
+        cout << "[selftest] " << (ok ? "PASS" : "FAIL") << "\n";
+        return ok ? 0 : 1;
+    }
+
     SmartStudyPlanner planner;
     WebServer server;
     server.start(planner);
     return 0;
-} 
+}
